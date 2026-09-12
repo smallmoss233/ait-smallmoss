@@ -1,11 +1,14 @@
 package dev.loqor.portal.client;
 
+import com.mojang.blaze3d.platform.GlStateManager;
 import com.mojang.blaze3d.systems.RenderSystem;
 import com.mojang.blaze3d.systems.VertexSorter;
 import dev.amble.ait.AITMod;
 import dev.amble.ait.client.boti.PortalParticleManager;
+import dev.amble.ait.core.AITDimensions;
 import dev.amble.ait.core.blockentities.DoorBlockEntity;
 import dev.amble.ait.core.blockentities.ExteriorBlockEntity;
+import dev.amble.ait.core.world.TardisServerWorld;
 import net.minecraft.block.BlockRenderType;
 import net.minecraft.block.BlockState;
 import net.minecraft.block.Blocks;
@@ -22,6 +25,7 @@ import net.minecraft.client.util.math.MatrixStack;
 import net.minecraft.client.world.ClientWorld;
 import net.minecraft.entity.Entity;
 import net.minecraft.fluid.FluidState;
+import net.minecraft.util.Identifier;
 import net.minecraft.util.math.*;
 import net.minecraft.util.math.random.Random;
 import net.minecraft.world.BlockRenderView;
@@ -33,13 +37,13 @@ import net.minecraft.world.chunk.light.LightingProvider;
 import org.jetbrains.annotations.Nullable;
 import org.joml.Matrix3f;
 import org.joml.Matrix4f;
+import org.lwjgl.opengl.GL11;
 
 import java.util.*;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * Renders the slice of the exterior world a TARDIS is standing in, as seen through the interior door.
@@ -54,6 +58,32 @@ import java.util.concurrent.atomic.AtomicBoolean;
 public class WorldGeometryRenderer {
     /** How many sections to (re)build per dispatch. Keeps each off-thread batch small so a hitch never stalls. */
     private static final int BUILD_BUDGET = 6;
+
+    /** Per-frame ceiling on the render-thread light flood-fill so a full rebuild/remesh spreads over frames. */
+    private static final long LIGHT_BUDGET_NANOS = 2_000_000L;
+
+    /** Idle frames with nothing to build before the retained builder pool's direct memory is released. */
+    private static final int POOL_RETAIN_FRAMES = 600;
+    private int idleFrames = 0;
+
+    /**
+     * {@link System#nanoTime()} of the last frame this doorway actually drew. A doorway that hasn't been drawn for
+     * longer than the configured idle window (the player looked away, or this TARDIS's interior is loaded but not
+     * currently viewed) has its baked geometry reclaimed by {@link #reclaimIfIdle} - the memory win for having several
+     * TARDISes open at once. Only the render thread writes it (in {@link #render}), only the client-tick loop reads it.
+     */
+    private long lastRenderNanos = 0L;
+
+    /** Set once the portal sky pass has failed. Under Iris the vanilla WorldRenderer.renderSky is mixin'd to touch
+     *  Iris's pipeline, which is already torn down (null) by the time a door renders at WorldRenderEvents.END, so the
+     *  sky pass throws every frame. We isolate it and log only the first failure to avoid per-frame spam; the
+     *  doorway's exterior-fog fill stands in for the sky. Live sky-through-portal under a shaderpack needs a live
+     *  Iris pipeline and is a Phase B concern. */
+    private boolean skyPassErrorLogged = false;
+
+    /** Separate log-once flag for the AFTER_ENTITIES sky INJECTION (as opposed to the END-phase Phase-A pass above),
+     *  so a failure there is distinguishable in the log instead of being masked by the END-phase failure. */
+    private boolean skyInjectErrorLogged = false;
 
     /** Big stack so deep block-model / biome-colour recursion can't overflow the build thread (the old cause of the
      * silently-swallowed StackOverflowError that left chunks unbuilt). */
@@ -101,15 +131,35 @@ public class WorldGeometryRenderer {
 
     private final int renderDistance;
 
-    private Direction doorFacing = Direction.NORTH;
-    private Direction lastDoorFacing = null;
+    // Outward door normal used to cull geometry behind the doorway. Stored as a float Vec3d (not a cardinal
+    // Direction) so the exterior's fine rotation - it can sit at any of the 16 RotationPropertyHelper steps (22.5
+    // deg each), not just N/S/E/W - culls against the true door plane instead of the nearest cardinal.
+    private Vec3d doorNormal = new Vec3d(0, 0, -1);
+    private Vec3d lastDoorNormal = null;
 
     // Frame-local view state, set at the top of every render() so the cull helpers and draw passes agree.
     private BlockPos centerPos = BlockPos.ORIGIN;
     private BlockPos lastBuiltCenter = null;
     private Matrix4f portalView = new Matrix4f();
     private Matrix4f portalProjection = new Matrix4f();
+    /** Rotation-only portal view (no eye translation) - reused by the sky pass, which sits at infinity. Kept in
+     *  sync with {@link #portalView} by both {@link #render} and {@link #updatePortalView} so {@link #injectSky}
+     *  can render the doorway sky matching the current frame's portal orientation. */
+    private Matrix4f portalRot = new Matrix4f();
     private Frustum frustum = null;
+
+    // Cached last-frame portal camera and world, used by injectBlockEntitiesAndEntities() so the gbuffer injector
+    // can reuse the same camera/world that render() used without needing them passed at injection time.
+    // One frame stale is fine for a probe; the alternative (reconstructing them in the injector) would require
+    // duplicating all of render()'s eye-position / yaw / pitch computation, which is more dangerous than stale.
+    private Camera lastPortalCamera = null;
+    private ClientWorld lastPortalWorld = null;
+
+    // Far plane for the doorway's sky pass only. Some TARDIS skyboxes (the time vortex) draw their geometry tens of
+    // thousands of blocks away; inside a TARDIS AIT's GameRendererMixin pushes getFarPlaneDistance() to 65536 (so the
+    // projection far is 65536 * 4). Through the exterior door the client is standing in the overworld, so that mixin
+    // never fires - we rebuild the interior's far plane locally for the sky so the distant vortex isn't clipped.
+    private static final float SKY_FAR_PLANE = 65536.0f * 4.0f;
 
     // Shared, reused immediate for the block-entity / entity / particle passes. Allocating a new BufferBuilder per
     // pass per door per frame churned off-heap direct memory (each grows well past its initial size, then is left for
@@ -132,11 +182,8 @@ public class WorldGeometryRenderer {
     /** Exterior fog colour computed by the most recent {@link #render}; the doorway background is painted with it. */
     private Vec3d lastExteriorFogColor = null;
 
-    /** Periodic counter for the particle diagnostic log line (see {@link #renderParticles}). Temporary. */
-    // private static int PARTICLE_DIAG_TICK = 0;
-
-    /** One-shot guard for the cloud diagnostic log line (see {@link #renderSky}). Temporary. */
-    // private static final AtomicBoolean CLOUD_DIAG = new AtomicBoolean(false);
+    /** Portal eye's exterior-world position from the last {@link #render}; the ambient particle spawn centres on it. */
+    private Vec3d lastEyeWorldPos = null;
 
     public WorldGeometryRenderer(int renderDistance) {
         this.renderDistance = renderDistance;
@@ -153,12 +200,53 @@ public class WorldGeometryRenderer {
         this.dirtySections.add(pos);
     }
 
+    /**
+     * Drops this doorway's baked geometry if it hasn't been drawn for at least {@code idleNanos} - the memory reclaim
+     * for TARDISes that are loaded but not currently being looked at (their doorway is frustum-culled, or their
+     * interior isn't the one the player is standing in, so {@link #render} never runs for them). Frees the per-section
+     * VBOs (the large GL / native cost) and the block-entity lists, then arms a full rebuild so a returning viewer
+     * re-bakes on demand. The shadow world and its streamed chunks are untouched, so updates keep flowing in and the
+     * rebuild is cheap. Must be called on the render thread (it closes GL buffers); the client-tick loop qualifies.
+     *
+     * @return {@code true} if geometry was reclaimed this call
+     */
+    public boolean reclaimIfIdle(long idleNanos) {
+        if (closed || sectionBuffers.isEmpty())
+            return false;
+        if (System.nanoTime() - lastRenderNanos < idleNanos)
+            return false;
+        // Don't reclaim mid-build: a batch in flight is about to upload VBOs on the render thread (see dispatchBuild),
+        // and clearing sectionBuffers now would either race that apply or immediately orphan what it uploads. Wait for
+        // the pipeline to settle - one more idle tick and we reclaim then.
+        if (buildFuture != null && !buildFuture.isDone())
+            return false;
+
+        for (Map<RenderLayer, VertexBuffer> layerBuffers : sectionBuffers.values())
+            for (VertexBuffer vbo : layerBuffers.values())
+                vbo.close();
+        sectionBuffers.clear();
+        sectionBlockEntities.clear();
+        dirtySections.clear();
+        buildAttempts.clear();
+        needsFullRebuild = true; // a returning viewer re-bakes the whole volume from the (still-live) shadow world
+        return true;
+    }
+
+    /** Cardinal convenience overload - used where the door genuinely is axis-aligned (e.g. the interior door). */
     public void setDoorFacing(Direction facing) {
-        if (this.lastDoorFacing != facing) {
+        setDoorNormal(Vec3d.of(facing.getVector()));
+    }
+
+    /**
+     * Sets the outward door normal (need not be axis-aligned - see {@link #doorNormal}). A change beyond a small
+     * epsilon triggers a full rebuild, since the behind-portal cull that shapes the baked volume depends on it.
+     */
+    public void setDoorNormal(Vec3d normal) {
+        Vec3d n = normal.normalize();
+        if (lastDoorNormal == null || lastDoorNormal.squaredDistanceTo(n) > 1.0e-4)
             markDirty();
-        }
-        this.doorFacing = facing;
-        this.lastDoorFacing = facing;
+        this.doorNormal = n;
+        this.lastDoorNormal = n;
     }
 
     /** The portal centre (exterior/interior block the volume is baked around), as of the last {@link #render}. */
@@ -171,6 +259,16 @@ public class WorldGeometryRenderer {
         return this.renderDistance;
     }
 
+    /** The portal eye's exterior-world position as of the last {@link #render}, or {@code null} before the first. */
+    public Vec3d eyeWorldPos() {
+        return this.lastEyeWorldPos;
+    }
+
+    /** The outward door normal (unit vector into the visible region) - the rough "look out the door" direction. */
+    public Vec3d doorNormal() {
+        return this.doorNormal;
+    }
+
     /**
      * @param eyeRelToCenter the portal camera's eye position, expressed relative to {@code centerPos} (the exterior
      *                       block). This is the player's eye mapped through the doorway into the exterior world.
@@ -180,6 +278,7 @@ public class WorldGeometryRenderer {
     public void render(UUID id, ClientWorld portalWorld, BlockPos centerPos, Vec3d eyeRelToCenter,
                        float portalYaw, float portalPitch, float tickDelta, boolean checkBehindPortal) {
         this.centerPos = centerPos;
+        this.lastRenderNanos = System.nanoTime(); // published for reclaimIfIdle: this doorway drew this frame
 
         // Geometry is stored relative to centerPos, so if the exterior block moved (e.g. the TARDIS re-landed) the
         // whole volume has to be rebuilt around the new origin or it would draw offset.
@@ -201,6 +300,7 @@ public class WorldGeometryRenderer {
         this.portalProjection = new Matrix4f(RenderSystem.getProjectionMatrix());
 
         Matrix4f portalRot = buildPortalRotation(portalYaw, portalPitch);
+        this.portalRot = portalRot;
         this.portalView = buildPortalView(portalRot, eyeRelToCenter);
 
         // Vanilla's Frustum convention: planes from a rotation-only view, boxes offset by the camera position. Our
@@ -217,12 +317,17 @@ public class WorldGeometryRenderer {
         portalCamera.setPos(centerPos.getX(), centerPos.getY(), centerPos.getZ());
         portalCamera.setRotation(portalYaw, portalPitch);
 
+        // Cache for the gbuffer injector (injectBlockEntitiesAndEntities). One frame stale is acceptable.
+        this.lastPortalCamera = portalCamera;
+        this.lastPortalWorld = portalWorld;
+
         Matrix4f originalProjection = new Matrix4f(RenderSystem.getProjectionMatrix());
         RenderSystem.setProjectionMatrix(portalProjection, VertexSorter.BY_DISTANCE);
 
         // The portal eye in exterior-world coordinates - the position the doorway's sky should be "seen from".
         Vec3d eyeWorldPos = new Vec3d(centerPos.getX() + eyeRelToCenter.x, centerPos.getY() + eyeRelToCenter.y,
                 centerPos.getZ() + eyeRelToCenter.z);
+        this.lastEyeWorldPos = eyeWorldPos; // published for the ambient-particle spawn (see eyeWorldPos())
 
         // Swap the frame's fog over to the exterior dimension before the sky pass. Setting the shader fog colour
         // directly is NOT enough: renderSky and renderClouds both call BackgroundRenderer.setFogBlack() mid-pass,
@@ -242,7 +347,26 @@ public class WorldGeometryRenderer {
         }
 
         // Sky sits at infinity, so it only takes the rotation (no eye translation) and never writes depth.
-        renderSky(id, portalWorld, portalRot, portalCamera, eyeWorldPos, tickDelta);
+        // Isolated like the terrain/entity passes below: under Iris the mixin'd vanilla WorldRenderer.renderSky
+        // dereferences Iris's pipeline, which is null once Iris has finalised the world render (this door draws at
+        // WorldRenderEvents.END). Catching here - log-once to avoid per-frame spam - lets terrain and entities still
+        // render through the doorway; the afbo's exterior-fog fill stands in for the sky.
+        //
+        // Under a shaderpack this END-phase pass is pointless: the pipeline is null so it NPEs every frame, AND the
+        // afbo it would draw into isn't blitted to the screen (the gbuffer injectors draw the sky at AFTER_ENTITIES
+        // via injectSky instead, where the pipeline is live). So skip it entirely there - saves the wasted attempt
+        // and the caught-exception churn.
+        if (!dev.amble.ait.compat.DependencyChecker.isIrisShaderPackInUse()) {
+            try {
+                renderSky(id, portalWorld, portalRot, portalCamera, eyeWorldPos, tickDelta);
+            } catch (Throwable t) {
+                if (!skyPassErrorLogged) {
+                    AITMod.LOGGER.error("BOTI: sky pass failed (expected under Iris shaders at the END phase - "
+                            + "the exterior-fog fill stands in for the sky); further occurrences suppressed", t);
+                    skyPassErrorLogged = true;
+                }
+            }
+        }
 
         // The lightmap (light coord -> final RGB; it bakes in sky darkness, time of day, the dimension's ambient
         // light and gamma) is rebuilt once per frame by GameRenderer from client.world - the *interior* dimension -
@@ -257,6 +381,18 @@ public class WorldGeometryRenderer {
         lightmap.tick();            // GameRenderer already consumed this frame's dirty flag - re-arm it
         lightmap.update(tickDelta); // recompute the ramp from the shadow world's dimension + (synced) time of day
         client.world = previousLightmapWorld;
+
+        // Exterior terrain fog distance. This is normally set at the tail of renderSky (for the terrain/entity
+        // passes that follow), but under Iris renderSky throws before reaching it (its pipeline is null at the
+        // END phase, so the mixin'd vanilla WorldRenderer.renderSky NPEs and we skip the pass). Applying it here,
+        // ahead of the terrain pass, guarantees the doorway's world gets the exterior's distant fog instead of the
+        // interior dimension's dense fog left in the shader state - which read as a flat "Minecraft-alpha" fog wall.
+        // The fog COLOUR was already set for the exterior by updateExteriorFog above; this only sets start/end/shape.
+        // In the non-Iris path renderSky sets the same values, so this is a harmless re-apply.
+        float terrainFogView = Math.max(client.gameRenderer.getViewDistance(), 32.0f);
+        RenderSystem.setShaderFogStart(terrainFogView - MathHelper.clamp(terrainFogView / 10.0f, 4.0f, 64.0f));
+        RenderSystem.setShaderFogEnd(terrainFogView);
+        RenderSystem.setShaderFogShape(FogShape.CYLINDER);
 
         MatrixStack modelViewStack = RenderSystem.getModelViewStack();
         modelViewStack.push();
@@ -350,9 +486,15 @@ public class WorldGeometryRenderer {
             enqueueVolume();
         }
 
-        if (dirtySections.isEmpty())
+        if (dirtySections.isEmpty()) {
+            if (!builderPool.isEmpty() && ++idleFrames > POOL_RETAIN_FRAMES) {
+                builderPool.clear();
+                idleFrames = 0;
+            }
             return;
+        }
 
+        idleFrames = 0;
         List<ChunkSectionPos> batch = drainBatch(BUILD_BUDGET);
         if (!batch.isEmpty())
             dispatchBuild(world, batch, checkBehindPortal);
@@ -415,21 +557,36 @@ public class WorldGeometryRenderer {
         // render thread). Doing it here keeps every light mutation single-threaded; the off-thread mesh then only
         // reads light. doLightUpdates() also commits the light PortalData staged via enqueueSectionData/setStatus.
         LightingProvider lightingProvider = world.getLightingProvider();
-        boolean queuedAny = false;
         BlockPos.Mutable lightPos = new BlockPos.Mutable();
-        for (ChunkSectionPos sectionPos : batch) {
-            if (world.getChunk(sectionPos.getX(), sectionPos.getZ(), ChunkStatus.FULL, false) == null)
-                continue; // not streamed yet - the async loop re-queues it; nothing to light
+        List<ChunkSectionPos> ready = new ArrayList<>(batch.size());
+        long lightDeadline = System.nanoTime() + LIGHT_BUDGET_NANOS;
+        int scanned = 0;
+        for (; scanned < batch.size(); scanned++) {
+            ChunkSectionPos sectionPos = batch.get(scanned);
+            if (world.getChunk(sectionPos.getX(), sectionPos.getZ(), ChunkStatus.FULL, false) == null) {
+                dirtySections.add(sectionPos); // not streamed yet - retry on a later frame
+                continue;
+            }
 
             int startX = sectionPos.getMinX(), startY = sectionPos.getMinY(), startZ = sectionPos.getMinZ();
             for (int x = startX; x <= startX + 15; x++)
                 for (int y = startY; y <= startY + 15; y++)
                     for (int z = startZ; z <= startZ + 15; z++)
                         lightingProvider.checkBlock(lightPos.set(x, y, z));
-            queuedAny = true;
+            ready.add(sectionPos);
+
+            if (System.nanoTime() >= lightDeadline)
+                break;
         }
-        if (queuedAny)
-            lightingProvider.doLightUpdates();
+        // Requeue whatever the per-frame light budget didn't reach so a full rebuild / remesh spreads over frames.
+        for (int i = scanned + 1; i < batch.size(); i++)
+            dirtySections.add(batch.get(i));
+
+        if (ready.isEmpty())
+            return;
+
+        lightingProvider.doLightUpdates();
+        final List<ChunkSectionPos> buildBatch = ready;
 
         // Serialised pipeline: this future only completes once the results have been uploaded (or discarded) on the
         // render thread. Because pumpBuilds waits for it before dispatching the next batch, the reusable builder pool
@@ -442,9 +599,9 @@ public class WorldGeometryRenderer {
             BlockRenderManager blockRenderManager = MinecraftClient.getInstance().getBlockRenderManager();
             Random random = Random.create();
 
-            List<SectionResult> results = new ArrayList<>(batch.size());
-            for (int slot = 0; slot < batch.size(); slot++) {
-                ChunkSectionPos sectionPos = batch.get(slot);
+            List<SectionResult> results = new ArrayList<>(buildBatch.size());
+            for (int slot = 0; slot < buildBatch.size(); slot++) {
+                ChunkSectionPos sectionPos = buildBatch.get(slot);
 
                 // Don't build a section whose column hasn't streamed into the shadow world yet: reading it would
                 // return all-air, and applySection would then *replace* the section's last good geometry with
@@ -549,8 +706,7 @@ public class WorldGeometryRenderer {
         if (dx * dx + dy * dy + dz * dz > reach * reach)
             return false;
 
-        Vec3i normal = doorFacing.getVector();
-        double inFront = dx * normal.getX() + dy * normal.getY() + dz * normal.getZ();
+        double inFront = dx * doorNormal.x + dy * doorNormal.y + dz * doorNormal.z;
         return inFront > -16.0; // keep sections straddling the door plane
     }
 
@@ -571,6 +727,97 @@ public class WorldGeometryRenderer {
         double minZ = pos.getMinZ() - centerPos.getZ();
 
         return frustum.isVisible(new Box(minX, minY, minZ, minX + 16, minY + 16, minZ + 16));
+    }
+
+    /**
+     * Recompute just the portal view/projection/frustum from the CURRENT camera-derived params, without meshing or
+     * drawing. The gbuffer-injection path calls this at {@code AFTER_ENTITIES} so the injected portal matches the
+     * current frame's camera instead of the 1-frame-stale view cached by the last {@code END} render - which is
+     * what smears the portal contents when the camera turns. {@code centerPos} and the baked VBOs stay as cached.
+     */
+    public void updatePortalView(Vec3d eyeRelToCenter, float portalYaw, float portalPitch) {
+        this.portalProjection = new Matrix4f(RenderSystem.getProjectionMatrix());
+        Matrix4f portalRot = buildPortalRotation(portalYaw, portalPitch);
+        this.portalRot = portalRot;
+        this.portalView = buildPortalView(portalRot, eyeRelToCenter);
+        this.frustum = new Frustum(portalRot, portalProjection);
+        this.frustum.setPosition(eyeRelToCenter.x, eyeRelToCenter.y, eyeRelToCenter.z);
+    }
+
+    /**
+     * Renders the portal world's real sky (sun/moon/stars/colour at its actual time of day) into the currently-bound
+     * gbuffer at {@code AFTER_ENTITIES}, where Iris's pipeline is live (unlike the {@code END}-phase Phase-A call,
+     * where {@code renderSky} NPEs because the pipeline is already finalised). Uses the cached portal camera/eye and
+     * the per-frame {@link #portalRot}; the caller sets the stencil clip to the aperture and the SKY Iris phase. The
+     * heavy sky pass is wrapped in the same log-once guard as {@link #render}, so a failure degrades to the caller's
+     * fog backdrop instead of throwing out of the injector.
+     */
+    public void injectSky(UUID id, ClientWorld portalWorld, float tickDelta) {
+        if (lastPortalCamera == null || lastEyeWorldPos == null || centerPos == null)
+            return;
+        PortalData data = PortalDataManager.get(id);
+        if (data == null || data.renderer() == null)
+            return;
+
+        // renderSky's own finally is tuned for the Phase-A path (it deliberately LEAVES the exterior/interior fog and
+        // portalProjection applied, because the terrain/entity passes that follow in render() use them). In the
+        // INJECTION path there is no such follow-up inside our control - the very next thing to draw is the rest of
+        // the scene (the real exterior box+doors, particles, weather), so that leaked fog/projection/blend state
+        // garbles it. Snapshot everything renderSky might touch and hard-restore it afterward.
+        Matrix4f savedProjection = new Matrix4f(RenderSystem.getProjectionMatrix());
+        VertexSorter savedSorter = RenderSystem.getVertexSorting();
+        float[] savedFogColor = RenderSystem.getShaderFogColor().clone();
+        float savedFogStart = RenderSystem.getShaderFogStart();
+        float savedFogEnd = RenderSystem.getShaderFogEnd();
+        FogShape savedFogShape = RenderSystem.getShaderFogShape();
+        float[] savedShaderColor = RenderSystem.getShaderColor().clone();
+        boolean savedBlend = GL11.glIsEnabled(GL11.GL_BLEND);
+        boolean savedCull = GL11.glIsEnabled(GL11.GL_CULL_FACE);
+        boolean savedDepthTest = GL11.glIsEnabled(GL11.GL_DEPTH_TEST);
+        boolean savedDepthMask = GL11.glGetBoolean(GL11.GL_DEPTH_WRITEMASK);
+        int savedDepthFunc = GL11.glGetInteger(GL11.GL_DEPTH_FUNC);
+
+        // Iris's built-in renderSky mixin dereferences a per-WorldRenderer pipeline field that Iris only sets on the
+        // MAIN renderer - the shadow renderer's is null, so temporarily install the live main pipeline onto it for
+        // the sky pass (restored below). Without this the pass NPEs and we fall back to the fog backdrop.
+        Object prevPipeline = dev.amble.ait.client.boti.iris.IrisSkyCompat.installMainPipeline(data.renderer());
+
+        // IP-style per-dimension resample: Iris samples the sun/moon/celestial/sky uniforms ONCE per frame from the
+        // viewer's dimension (here the fixed-midnight TARDIS interior), so without this the doorway sky renders with
+        // the interior's permanent-midnight sun no matter the exterior's real time. Swap client.world to the exterior
+        // shadow world and force Iris to re-evaluate its PER_FRAME uniforms NOW, so the sky pass below draws with the
+        // exterior time of day. Reverted (world + resample) in the finally so the deferred/composite pass that lights
+        // the rest of the scene goes back to the viewer's dimension.
+        MinecraftClient mc = MinecraftClient.getInstance();
+        ClientWorld prevWorld = mc.world;
+        mc.world = portalWorld;
+        dev.amble.ait.client.boti.iris.IrisSkyCompat.resampleFrameUniforms();
+        try {
+            renderSky(id, portalWorld, portalRot, lastPortalCamera, lastEyeWorldPos, tickDelta);
+        } catch (Throwable t) {
+            if (!skyInjectErrorLogged) {
+                AITMod.LOGGER.error("BOTI: doorway sky injection (AFTER_ENTITIES) failed; falling back to the fog "
+                        + "backdrop; further occurrences suppressed", t);
+                skyInjectErrorLogged = true;
+            }
+        } finally {
+            mc.world = prevWorld;
+            dev.amble.ait.client.boti.iris.IrisSkyCompat.resampleFrameUniforms();
+            dev.amble.ait.client.boti.iris.IrisSkyCompat.restore(data.renderer(), prevPipeline);
+
+            // Hard-restore all snapshotted state so nothing leaks onto the scene rendered after this event.
+            RenderSystem.setProjectionMatrix(savedProjection, savedSorter);
+            RenderSystem.setShaderFogColor(savedFogColor[0], savedFogColor[1], savedFogColor[2], savedFogColor[3]);
+            RenderSystem.setShaderFogStart(savedFogStart);
+            RenderSystem.setShaderFogEnd(savedFogEnd);
+            RenderSystem.setShaderFogShape(savedFogShape);
+            RenderSystem.setShaderColor(savedShaderColor[0], savedShaderColor[1], savedShaderColor[2], savedShaderColor[3]);
+            if (savedBlend) RenderSystem.enableBlend(); else RenderSystem.disableBlend();
+            if (savedCull) RenderSystem.enableCull(); else RenderSystem.disableCull();
+            if (savedDepthTest) RenderSystem.enableDepthTest(); else RenderSystem.disableDepthTest();
+            RenderSystem.depthMask(savedDepthMask);
+            RenderSystem.depthFunc(savedDepthFunc);
+        }
     }
 
     // ===== Draw passes =====
@@ -619,6 +866,167 @@ public class WorldGeometryRenderer {
     }
 
     /**
+     * THROWAWAY gbuffer-injection probe. Draws this doorway's baked SOLID terrain straight into whatever framebuffer
+     * is currently bound (called at {@code AFTER_ENTITIES}, that is Iris's main gbuffer, before the deferred pass),
+     * with Iris's TERRAIN_SOLID phase set so Iris substitutes {@code gbuffers_terrain}. If Iris's deferred+composite
+     * then light it, gbuffer-injection is viable. Uses the cached {@code portalView}/{@code portalProjection} from the
+     * previous frame's END render (one frame stale, fine for a probe). Unclipped by design - it will splatter over the
+     * opaque scene; clipping to the doorway is a later milestone. No afbo: we draw into the live gbuffer directly.
+     */
+    public void debugInjectTerrainIntoGbuffer() {
+        if (sectionBuffers.isEmpty())
+            return;
+
+        List<Map<RenderLayer, VertexBuffer>> visible = new ArrayList<>();
+        for (Map.Entry<ChunkSectionPos, Map<RenderLayer, VertexBuffer>> entry : sectionBuffers.entrySet()) {
+            if (isSectionVisible(entry.getKey()))
+                visible.add(entry.getValue());
+        }
+        if (visible.isEmpty())
+            return;
+
+        // Ensure injected terrain writes depth so it self-sorts and occludes correctly.
+        RenderSystem.enableDepthTest();
+        boolean prevDepthMask = GL11.glGetBoolean(GL11.GL_DEPTH_WRITEMASK);
+        RenderSystem.depthMask(true);
+
+        RenderSystem.setShaderTexture(0, SpriteAtlasTexture.BLOCK_ATLAS_TEXTURE);
+
+        boolean phased = dev.amble.ait.client.boti.iris.IrisPhase.setTerrainSolid();
+        try {
+            drawLayer(RenderLayer.getSolid(), visible);
+        } finally {
+            if (phased)
+                dev.amble.ait.client.boti.iris.IrisPhase.reset();
+        }
+
+        phased = dev.amble.ait.client.boti.iris.IrisPhase.setTerrainCutoutMipped();
+        try {
+            drawLayer(RenderLayer.getCutoutMipped(), visible);
+        } finally {
+            if (phased)
+                dev.amble.ait.client.boti.iris.IrisPhase.reset();
+        }
+
+        phased = dev.amble.ait.client.boti.iris.IrisPhase.setTerrainCutout();
+        try {
+            drawLayer(RenderLayer.getCutout(), visible);
+        } finally {
+            if (phased)
+                dev.amble.ait.client.boti.iris.IrisPhase.reset();
+        }
+
+        RenderSystem.depthMask(prevDepthMask);
+    }
+
+    /**
+     * Injects the portal world's TRANSLUCENT terrain layer (glass, water, ice, stained glass) into the currently-
+     * bound gbuffer, in Iris's {@code TERRAIN_TRANSLUCENT} phase ({@code gbuffers_water}). Called by the gbuffer-
+     * injection paths AFTER {@link #debugInjectTerrainIntoGbuffer()} (so it blends over the already-injected opaque
+     * terrain) and BEFORE the door-plane depth write. Blends with the standard translucent func and tests but does
+     * NOT write depth, so it self-composites over the opaque portal terrain without occluding it.
+     */
+    public void debugInjectTranslucentIntoGbuffer() {
+        if (sectionBuffers.isEmpty())
+            return;
+
+        List<Map<RenderLayer, VertexBuffer>> visible = new ArrayList<>();
+        for (Map.Entry<ChunkSectionPos, Map<RenderLayer, VertexBuffer>> entry : sectionBuffers.entrySet()) {
+            if (isSectionVisible(entry.getKey()))
+                visible.add(entry.getValue());
+        }
+        if (visible.isEmpty())
+            return;
+
+        RenderSystem.enableBlend();
+        RenderSystem.defaultBlendFunc();
+        RenderSystem.enableDepthTest();
+        boolean prevDepthMask = GL11.glGetBoolean(GL11.GL_DEPTH_WRITEMASK);
+        RenderSystem.depthMask(false); // translucent tests against the opaque portal terrain but writes no depth
+
+        RenderSystem.setShaderTexture(0, SpriteAtlasTexture.BLOCK_ATLAS_TEXTURE);
+
+        boolean phased = dev.amble.ait.client.boti.iris.IrisPhase.setTerrainTranslucent();
+        try {
+            drawLayer(RenderLayer.getTranslucent(), visible);
+        } finally {
+            if (phased)
+                dev.amble.ait.client.boti.iris.IrisPhase.reset();
+        }
+
+        RenderSystem.depthMask(prevDepthMask);
+        RenderSystem.disableBlend();
+    }
+
+    /**
+     * Injects the exterior portal world's block entities and entities into the currently-bound gbuffer (Iris's
+     * main gbuffer at {@code AFTER_ENTITIES}), using cached state from the previous frame's {@link #render} call.
+     * Mirrors the matrix save/restore in {@link #render} exactly so no matrix state leaks into the main render.
+     *
+     * <p>Must be called from inside the stencil-clipped section of {@link dev.amble.ait.client.boti.iris.GbufferInjectionProbe},
+     * after {@link #debugInjectTerrainIntoGbuffer()}.
+     *
+     * @param tickDelta interpolation factor from {@code WorldRenderContext.tickDelta()}
+     */
+    public void injectBlockEntitiesAndEntities(float tickDelta) {
+        if (lastPortalCamera == null || lastPortalWorld == null || centerPos == null)
+            return;
+
+        // Ensure depth writes are active for injected geometry (same guard as debugInjectTerrainIntoGbuffer).
+        RenderSystem.enableDepthTest();
+        boolean prevDepthMask = GL11.glGetBoolean(GL11.GL_DEPTH_WRITEMASK);
+        RenderSystem.depthMask(true);
+
+        // Save projection; set the portal projection for the duration of the draw (mirrors render()).
+        Matrix4f originalProjection = new Matrix4f(RenderSystem.getProjectionMatrix());
+        RenderSystem.setProjectionMatrix(portalProjection, VertexSorter.BY_DISTANCE);
+
+        // Push and configure model-view to the portal view (mirrors the push in render()).
+        MatrixStack modelViewStack = RenderSystem.getModelViewStack();
+        modelViewStack.push();
+        try {
+            modelViewStack.peek().getPositionMatrix().set(portalView);
+            modelViewStack.peek().getNormalMatrix().set(new Matrix3f(portalView));
+            RenderSystem.applyModelViewMatrix();
+
+            // Block entities — wrapped in the BLOCK_ENTITIES Iris phase so gbuffers_block draws them.
+            boolean p1 = dev.amble.ait.client.boti.iris.IrisPhase.setBlockEntities();
+            try {
+                renderBlockEntities(lastPortalWorld, tickDelta, lastPortalCamera);
+            } finally {
+                if (p1) dev.amble.ait.client.boti.iris.IrisPhase.reset();
+            }
+
+            // Entities — wrapped in the ENTITIES Iris phase so gbuffers_entities draws them.
+            boolean p2 = dev.amble.ait.client.boti.iris.IrisPhase.setEntities();
+            try {
+                renderEntities(lastPortalWorld, tickDelta, lastPortalCamera);
+            } finally {
+                if (p2) dev.amble.ait.client.boti.iris.IrisPhase.reset();
+            }
+
+        } finally {
+            // Always restore — a leaked push corrupts the main game's model-view matrix next frame.
+            modelViewStack.pop();
+            RenderSystem.applyModelViewMatrix();
+            RenderSystem.setProjectionMatrix(originalProjection, VertexSorter.BY_DISTANCE);
+
+            // Restore both dispatcher configurations to the main world/camera. renderBlockEntities and
+            // renderEntities reconfigure the shared dispatchers to point at the portal world; without this
+            // restore they stay pointed at the portal world until render()'s own finally runs at END,
+            // meaning any interior block entities drawn between AFTER_ENTITIES and END query light from
+            // the exterior dimension and get wrong (dark/transparent) lighting.
+            MinecraftClient client = MinecraftClient.getInstance();
+            Camera mainCamera = client.gameRenderer.getCamera();
+            client.getBlockEntityRenderDispatcher().configure(client.world, mainCamera, client.crosshairTarget);
+            client.getEntityRenderDispatcher().configure(client.world, mainCamera, client.targetedEntity);
+
+            // Restore the prior depth-write state so callers aren't surprised by an unconditional enable.
+            RenderSystem.depthMask(prevDepthMask);
+        }
+    }
+
+    /**
      * Draws the exterior dimension's sky into the doorway so it shows the sky for wherever the TARDIS actually is.
      * <p>
      * The doorway is already cleared to the exterior dimension's real sky colour (see {@code TardisDoorBOTI}); on top
@@ -657,6 +1065,21 @@ public class WorldGeometryRenderer {
         modelViewStack.peek().getNormalMatrix().identity();
         RenderSystem.applyModelViewMatrix();
 
+        // Two of the TARDIS skyboxes draw their contents from the REAL game camera rather than the matrices we hand
+        // renderSky: SkyboxUtil.renderVortexSky puts the vortex ~50000 blocks out, and the moon/space skyboxes place
+        // their planets via CelestialBodyRenderer, which reads MinecraftClient.gameRenderer.getCamera() directly (its
+        // pitch/yaw and pos) instead of the sky matrix stack. Inside a real TARDIS the game camera IS the viewer, so
+        // both work; through the doorway the game camera is the player standing in the OVERWORLD, looking a different
+        // way (offset by the portal deltaYaw), so the planets get oriented toward wherever the player really faces -
+        // usually right out of the doorway aperture, i.e. invisible. Point the real camera at the portal view for the
+        // duration of the sky pass so those camera-driven bodies line up with the dome; restored in the finally.
+        Camera gameCamera = client.gameRenderer.getCamera();
+        Vec3d savedCamPos = gameCamera.getPos();
+        float savedCamYaw = gameCamera.getYaw();
+        float savedCamPitch = gameCamera.getPitch();
+        gameCamera.setPos(eyeWorldPos.x, eyeWorldPos.y, eyeWorldPos.z);
+        gameCamera.setRotation(portalCamera.getYaw(), portalCamera.getPitch());
+
         try {
             client.world = portalWorld;
             portalSkyCameraPos = eyeWorldPos; // WorldRendererBotiMixin reads this inside renderSky
@@ -665,6 +1088,25 @@ public class WorldGeometryRenderer {
             skyStack.multiplyPositionMatrix(portalRotation);
 
             RenderSystem.depthMask(false);
+
+            // The vortex skybox draws its geometry ~50000 blocks away, well past the overworld's normal ~1-2k far
+            // plane that portalProjection carries out here - so it (and only it, nearer skyboxes at z ~= 100 survive)
+            // gets clipped entirely. Build a sky-only projection exactly the way vanilla GameRenderer builds its own
+            // (getFov + framebuffer aspect), but with the interior's far plane so the distant geometry isn't clipped.
+            // Sky writes no depth, so extending the far plane is harmless for everything else. Bound on the global
+            // projection too: the vortex/planets draw via Tessellator / entity consumers with the global RenderSystem
+            // projection, not the matrix we pass to renderSky. Restored to portalProjection in the finally below.
+            Matrix4f skyProjection = portalProjection;
+            try {
+                double fovDeg = client.gameRenderer.getFov(portalCamera, tickDelta, true);
+                float aspect = (float) client.getWindow().getFramebufferWidth()
+                        / (float) client.getWindow().getFramebufferHeight();
+                skyProjection = new Matrix4f().setPerspective((float) (fovDeg * (Math.PI / 180.0)), aspect, 0.05f,
+                        SKY_FAR_PLANE);
+            } catch (Exception e) {
+                AITMod.LOGGER.error("BOTI: failed to build sky projection; far skyboxes may be clipped", e);
+            }
+            RenderSystem.setProjectionMatrix(skyProjection, VertexSorter.BY_DISTANCE);
 
             // Bind the position program BEFORE renderSky. Vanilla draws the upper sky dome (lightSkyBuffer, a
             // POSITION-format VBO) with whatever shader RenderSystem.getShader() happens to hold - it only sets an
@@ -680,7 +1122,7 @@ public class WorldGeometryRenderer {
             // setFogBlack). The old "push the fog past all sky geometry" workaround killed the fade, which is why
             // the doorway sky was one flat colour with no horizon gradient.
             float viewDistanceBlocks = Math.max(client.gameRenderer.getViewDistance(), 32.0f);
-            data.renderer().renderSky(skyStack, portalProjection, tickDelta, portalCamera, false, () -> {
+            data.renderer().renderSky(skyStack, skyProjection, tickDelta, portalCamera, false, () -> {
                 RenderSystem.setShaderFogStart(0.0f);
                 RenderSystem.setShaderFogEnd(viewDistanceBlocks);
                 RenderSystem.setShaderFogShape(FogShape.CYLINDER);
@@ -694,28 +1136,25 @@ public class WorldGeometryRenderer {
             RenderSystem.setShaderFogEnd(viewDistanceBlocks);
             RenderSystem.setShaderFogShape(FogShape.CYLINDER);
 
-            // Clouds are a separate pass in vanilla (WorldRenderer.renderClouds), so the doorway never drew them.
-            // Draw them now, inside the same client.world swap. renderClouds builds its sheet relative to the camera
-            // coords passed here and draws it through cloudStack (rotation ONLY - no eye translation, unlike the
-            // portalView that terrain/entities/particles use). So the camera coords MUST be the portal eye's world
-            // position, not centerPos: pass centerPos and the whole cloud layer is shifted by eyeRelToCenter, which is
-            // large whenever the player stands away from the interior door - the clouds slide right out of the doorway
-            // ("no clouds"). Passing eyeWorldPos puts the eye at the rotation origin, exactly matching the terrain
-            // (which is R * (blockPos - eyeWorldPos)), so the clouds line up above the visible ground.
-            CloudRenderMode cloudMode = client.options.getCloudRenderModeValue();
-            //if (CLOUD_DIAG.compareAndSet(false, true))
-            //    AITMod.LOGGER.info("BOTI cloud diag: mode={} cloudsHeight={} eyeY={} centerY={}",
-            //            cloudMode, portalWorld.getDimensionEffects().getCloudsHeight(), eyeWorldPos.y, centerPos.getY());
-            if (cloudMode != CloudRenderMode.OFF) {
-                RenderSystem.setShaderColor(1.0f, 1.0f, 1.0f, 1.0f);
-                MatrixStack cloudStack = new MatrixStack();
-                cloudStack.multiplyPositionMatrix(portalRotation);
-                data.renderer().renderClouds(cloudStack, portalProjection, tickDelta,
-                        eyeWorldPos.x, eyeWorldPos.y, eyeWorldPos.z);
-            }
+            // Clouds. We must NOT call data.renderer().renderClouds(...): Sodium @Overwrites
+            // WorldRenderer.renderClouds on EVERY instance (including our shadow one) with its own CloudRenderer,
+            // which is wired to the main client camera/world and ignores the shadow world, portal camera and matrices
+            // we hand it - so through the doorway it draws nothing. Render the cloud sheet ourselves (a plain method
+            // no mixin targets), positioned relative to eyeWorldPos so it lines up above the terrain shown in the door.
+            // Skip clouds entirely for TARDIS interior dimensions: interiors have no sky, and their dimension effects
+            // can still report a cloud height, which would paint a cloud sheet over the interior skybox. (Must be &&
+            // with the negation - a previous || meant clouds still drew in interiors whenever cloud mode was on.)
+            if (client.options.getCloudRenderModeValue() != CloudRenderMode.OFF
+                    && !TardisServerWorld.isTardisDimension(portalWorld) && portalWorld.getRegistryKey() != AITDimensions.TIME_VORTEX_WORLD)
+                renderPortalClouds(portalWorld, portalRotation, tickDelta, eyeWorldPos);
         } finally {
             portalSkyCameraPos = null;
             client.world = previousWorld;
+            // Put the real game camera back exactly where the rest of the frame expects it (the terrain/entity passes
+            // below use portalCamera, but everything after this door - the hand, main-world particles, weather - reads
+            // the real camera again).
+            gameCamera.setPos(savedCamPos.x, savedCamPos.y, savedCamPos.z);
+            gameCamera.setRotation(savedCamYaw, savedCamPitch);
             modelViewStack.pop();
             RenderSystem.applyModelViewMatrix();
             // Vanilla renderSky leaves these in various states; reset to sane terrain defaults.
@@ -739,7 +1178,15 @@ public class WorldGeometryRenderer {
         MinecraftClient client = MinecraftClient.getInstance();
 
         Camera fogCamera = new Camera();
-        fogCamera.setPos(eyePos.x, eyePos.y, eyePos.z);
+        // BackgroundRenderer darkens the fog toward black within ~32 blocks of the world bottom: it multiplies the fog
+        // by clamp((eyeY - bottomY) * horizonShadingRatio, 0, 1). Vanilla sets that ratio to 1.0 for FLAT worlds to
+        // suppress the effect (so a superflat surface a few blocks above bedrock still looks bright), but our shadow
+        // world's LevelProperties always report flatWorld=false, so it uses the normal 1/32 ratio - and a doorway onto
+        // a superflat overworld fogged its horizon to near-black. We can't cheaply learn the mirrored dimension's flat
+        // flag on the client, so compute the fog COLOUR as if the eye sat just above that shading band (bottomY + 34,
+        // where the term clamps to 1). Only the returned colour changes; the real sky/terrain still render at eyePos.
+        double fogY = Math.max(eyePos.y, portalWorld.getBottomY() + 34.0);
+        fogCamera.setPos(eyePos.x, fogY, eyePos.z);
         fogCamera.setRotation(yaw, pitch);
 
         BackgroundRenderer.render(fogCamera, tickDelta, portalWorld, renderDistance,
@@ -760,6 +1207,83 @@ public class WorldGeometryRenderer {
         return portalSkyCameraPos;
     }
 
+    /** The vanilla cloud texture, sampled by our own cloud sheet (see {@link #renderPortalClouds}). */
+    private static final Identifier CLOUDS_TEXTURE = new Identifier("textures/environment/clouds.png");
+
+    /**
+     * Draws a flat cloud sheet for the shadow world's dimension into the doorway.
+     * <p>
+     * This is a hand-rolled copy of vanilla's FAST cloud layer rather than a call to
+     * {@code WorldRenderer.renderClouds}, because Sodium {@code @Overwrite}s that method on every {@link WorldRenderer}
+     * instance (ours included) with its own {@code CloudRenderer} bound to the main client camera/world - so the
+     * vanilla path draws nothing through the portal. The sheet is positioned relative to {@code eyePos} (the portal
+     * eye in exterior-world coordinates) and drawn through {@code cloudRotation} so it lines up above the terrain the
+     * doorway shows, exactly like the terrain pass ({@code R * (pos - eyeWorldPos)}).
+     */
+    private void renderPortalClouds(ClientWorld world, Matrix4f cloudRotation, float tickDelta, Vec3d eyePos) {
+        float cloudHeight = world.getDimensionEffects().getCloudsHeight();
+        if (Float.isNaN(cloudHeight))
+            return; // nether / end: no clouds
+
+        // Camera-relative cloud origin + smooth scroll, mirroring WorldRenderer#renderClouds.
+        double drift = (world.getTime() + tickDelta) * 0.03;
+        double ox = (eyePos.x + drift) / 12.0;
+        double oy = cloudHeight - eyePos.y + 0.33;
+        double oz = eyePos.z / 12.0 + 0.33;
+        ox -= MathHelper.floor(ox / 2048.0) * 2048;
+        oz -= MathHelper.floor(oz / 2048.0) * 2048;
+        float fracX = (float) (ox - MathHelper.floor(ox));
+        float fracY = (float) (oy / 4.0 - MathHelper.floor(oy / 4.0)) * 4.0F;
+        float fracZ = (float) (oz - MathHelper.floor(oz));
+
+        Vec3d color = world.getCloudsColor(tickDelta);
+        float cr = (float) color.x, cg = (float) color.y, cb = (float) color.z;
+        float g = 0.00390625F; // 1/256, the cloud texture's per-block UV step
+        float texX = MathHelper.floor(ox) * g;
+        float texZ = MathHelper.floor(oz) * g;
+        float y = (float) Math.floor(oy / 4.0) * 4.0F; // baked cloud-sheet height (relative to the eye)
+
+        BufferBuilder builder = Tessellator.getInstance().getBuffer();
+        builder.begin(VertexFormat.DrawMode.QUADS, VertexFormats.POSITION_TEXTURE_COLOR_NORMAL);
+        for (int qx = -32; qx < 32; qx += 32) {
+            for (int qz = -32; qz < 32; qz += 32) {
+                builder.vertex(qx, y, qz + 32).texture(qx * g + texX, (qz + 32) * g + texZ).color(cr, cg, cb, 0.8F).normal(0.0F, -1.0F, 0.0F).next();
+                builder.vertex(qx + 32, y, qz + 32).texture((qx + 32) * g + texX, (qz + 32) * g + texZ).color(cr, cg, cb, 0.8F).normal(0.0F, -1.0F, 0.0F).next();
+                builder.vertex(qx + 32, y, qz).texture((qx + 32) * g + texX, qz * g + texZ).color(cr, cg, cb, 0.8F).normal(0.0F, -1.0F, 0.0F).next();
+                builder.vertex(qx, y, qz).texture(qx * g + texX, qz * g + texZ).color(cr, cg, cb, 0.8F).normal(0.0F, -1.0F, 0.0F).next();
+            }
+        }
+        BufferBuilder.BuiltBuffer built = builder.end();
+
+        RenderSystem.setShader(GameRenderer::getPositionTexColorNormalProgram);
+        RenderSystem.setShaderTexture(0, CLOUDS_TEXTURE);
+        RenderSystem.setShaderColor(1.0F, 1.0F, 1.0F, 1.0F);
+        RenderSystem.enableBlend();
+        RenderSystem.blendFuncSeparate(GlStateManager.SrcFactor.SRC_ALPHA, GlStateManager.DstFactor.ONE_MINUS_SRC_ALPHA,
+                GlStateManager.SrcFactor.ONE, GlStateManager.DstFactor.ONE_MINUS_SRC_ALPHA);
+        RenderSystem.disableCull();
+        RenderSystem.enableDepthTest();
+        RenderSystem.depthMask(true);
+
+        // renderSky runs with the global model-view forced to identity (for the sun/moon); set it to the cloud matrix
+        // for this draw only, then hand identity back so the rest of the sky pass is undisturbed.
+        MatrixStack modelView = RenderSystem.getModelViewStack();
+        modelView.push();
+        modelView.peek().getPositionMatrix().set(cloudRotation);
+        modelView.scale(12.0F, 1.0F, 12.0F);
+        modelView.translate(-fracX, fracY, -fracZ);
+        RenderSystem.applyModelViewMatrix();
+        try {
+            BufferRenderer.drawWithGlobalProgram(built);
+        } finally {
+            modelView.pop();
+            RenderSystem.applyModelViewMatrix();
+            RenderSystem.enableCull();
+            RenderSystem.disableBlend();
+            RenderSystem.defaultBlendFunc();
+        }
+    }
+
     private void renderBlockEntities(ClientWorld portalWorld, float tickDelta, Camera portalCamera) {
         MinecraftClient client = MinecraftClient.getInstance();
         BlockEntityRenderDispatcher dispatcher = client.getBlockEntityRenderDispatcher();
@@ -767,30 +1291,31 @@ public class WorldGeometryRenderer {
         dispatcher.configure(portalWorld, portalCamera, client.crosshairTarget);
 
         MatrixStack matrices = new MatrixStack();
-        List<BlockEntity> snapshot = new ArrayList<>();
-        for (List<BlockEntity> sectionEntities : sectionBlockEntities.values())
-            snapshot.addAll(sectionEntities);
+        Box cameraBox = new Box(portalCamera.getBlockPos());
 
-        for (BlockEntity blockEntity : snapshot) {
-            BlockPos blockPos = blockEntity.getPos();
+        for (List<BlockEntity> sectionEntities : sectionBlockEntities.values()) {
+            for (BlockEntity blockEntity : sectionEntities) {
+                BlockPos blockPos = blockEntity.getPos();
 
-            if (!isWithinRenderBounds(blockPos))
-                continue;
-            if ((blockEntity instanceof DoorBlockEntity || blockEntity instanceof ExteriorBlockEntity) && blockEntity.getPos() == portalCamera.getBlockPos())
-                continue;
+                if (!isWithinRenderBounds(blockPos))
+                    continue;
 
-            matrices.push();
-            matrices.translate(
-                    blockPos.getX() - centerPos.getX(),
-                    blockPos.getY() - centerPos.getY(),
-                    blockPos.getZ() - centerPos.getZ());
+                if ((blockEntity instanceof DoorBlockEntity || blockEntity instanceof ExteriorBlockEntity) && cameraBox.contains(blockPos.toCenterPos()))
+                    continue;
 
-            try {
-                dispatcher.render(blockEntity, tickDelta, matrices, immediate);
-            } catch (Throwable t) {
-                AITMod.LOGGER.error("BOTI: failed to render block entity {}", blockEntity, t);
-            } finally {
-                matrices.pop();
+                matrices.push();
+                matrices.translate(
+                        blockPos.getX() - centerPos.getX(),
+                        blockPos.getY() - centerPos.getY(),
+                        blockPos.getZ() - centerPos.getZ());
+
+                try {
+                    dispatcher.render(blockEntity, tickDelta, matrices, immediate);
+                } catch (Throwable t) {
+                    AITMod.LOGGER.error("BOTI: failed to render block entity {}", blockEntity, t);
+                } finally {
+                    matrices.pop();
+                }
             }
         }
 
@@ -848,15 +1373,6 @@ public class WorldGeometryRenderer {
 
     private void renderParticles(UUID id, Camera portalCamera, float tickDelta) {
         PortalParticleManager manager = PortalDataManager.particles(id);
-
-        // DIAGNOSTIC (periodic, ~every 100 renders): the previous one-shot version only caught the expected first
-        // frame race (the manager is created lazily the tick after the first render sets centerPos), so it couldn't
-        // report steady state. This reports whether the manager exists and how many particles it holds over time,
-        // distinguishing a spawn failure (never created / count 0) from a render failure (count > 0, nothing shows).
-        /*if (PARTICLE_DIAG_TICK++ % 100 == 0)
-            AITMod.LOGGER.info("BOTI particle diag: manager={} count=[{}] for {}",
-                    manager != null, manager == null ? "-" : manager.getDebugString(), id);
-*/
         if (manager == null)
             return;
 
@@ -989,8 +1505,7 @@ public class WorldGeometryRenderer {
 
     /** True for blocks on the far side of the door plane - they can never be seen through the doorway. */
     private boolean isBehindPortal(double relX, double relY, double relZ) {
-        Vec3i normal = doorFacing.getVector();
-        return relX * normal.getX() + relY * normal.getY() + relZ * normal.getZ() < 0.0;
+        return relX * doorNormal.x + relY * doorNormal.y + relZ * doorNormal.z < 0.0;
     }
 
     /** Uploads one section's freshly-built buffers, replacing (or removing) whatever was there before. */

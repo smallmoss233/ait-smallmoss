@@ -93,6 +93,20 @@ public class BiggerOnTheInside implements ModInitializer {
     private static final ChunkTicketType<UUID> PORTAL_TICKET =
             ChunkTicketType.create("portal_proxy", UUID::compareTo);
 
+    /**
+     * Ticket radius for the mirrored area. A chunk's level is {@code 33 - radius} (see
+     * {@code ChunkTicketManager#addTicket}), and {@code ChunkLevels} only ticks blocks at level {@code <= 32} and
+     * entities at level {@code <= 31}. A radius of {@code 2} therefore puts every ticketed chunk at level {@code 31}
+     * (ENTITY_TICKING) - exactly what a nearby real player does - so the mirrored world actually simulates: redstone,
+     * fluids, falling blocks and scheduled/random ticks all run.
+     * <p>
+     * The previous radius of {@code 0} loaded the chunks at level {@code 33} (FULL) but never ticked them. The
+     * exterior stream mirrors a normal dimension that a real player keeps ticking anyway, so it looked fine; the
+     * interior is an isolated {@code TardisServerWorld} with no player inside when viewed through the exterior door,
+     * so at level {@code 33} it showed a frozen snapshot - no redstone, no falling blocks, no fluid updates.
+     */
+    private static final int TICKING_RADIUS = 2;
+
     /** One entry per TARDIS currently being viewed from inside its interior (exterior stream). */
     private static final Map<UUID, ProxyEntry> PROXIES = new HashMap<>();
 
@@ -110,6 +124,14 @@ public class BiggerOnTheInside implements ModInitializer {
      * per-tick smooth.
      */
     private static final long REFRESH_INTERVAL = 5L;
+
+    /**
+     * How long (ms) an interior stream is kept alive after it stops being strictly viewable (door closed, viewer
+     * momentarily out of range, interior briefly unloaded). Tearing down immediately forces a full interior re-stream
+     * - and a full client mesh rebuild - on the next door open, so a grace window lets ordinary open/close and
+     * step-in/step-out reuse the already-streamed interior instead of rebuilding it.
+     */
+    private static final long INTERIOR_GRACE_MS = 30_000L;
 
     /**
      * Reused across refresh cycles to avoid allocating a new collection on every tick.
@@ -299,42 +321,72 @@ public class BiggerOnTheInside implements ModInitializer {
      *
      * @return {@code true} if an interior proxy is (now) active for this TARDIS
      */
+    /**
+     * Decides whether an interior stream that is not strictly viewable this cycle should stay alive. Returns
+     * {@code true} (keep it, marking it active so the tick loop won't tear it down) while inside the grace window,
+     * {@code false} once the window has elapsed (or if there is no stream to keep). Never rebuilds or re-streams -
+     * the existing proxy and its chunk tickets are simply left in place.
+     */
+    private static boolean keepDuringGrace(ProxyEntry entry) {
+        return entry != null && System.currentTimeMillis() <= entry.graceDeadline;
+    }
+
     private static boolean ensureInteriorProxy(MinecraftServer server, ServerTardis tardis) {
         UUID key = tardis.getUuid();
+        ProxyEntry entry = INTERIOR_PROXIES.get(key);
 
+        // The interior stream must NOT be tied moment-to-moment to the door being open. Tearing it down the instant
+        // the door closes means the next open re-sends the whole interior and the client rebuilds its entire mesh
+        // (confirmed in-game: open/close/open flickers a full rebuild every time). These conditions go transiently
+        // false during ordinary play - the door animating shut, a player stepping in/out (briefly in neither world or
+        // out of range), the interior momentarily unloaded - so keep an existing stream alive through a short grace
+        // window and only let it tear down once the TARDIS has genuinely stopped being viewable. Rendering is gated on
+        // the door client-side already, so streaming a little longer than strictly visible costs only some chunk
+        // tickets, and it matches the exterior stream's stability.
         if (!tardis.travel().isLanded() || !tardis.door().isOpen())
-            return false;
+            return keepDuringGrace(entry);
 
         List<ServerPlayerEntity> viewers = exteriorViewers(tardis);
         if (viewers.isEmpty())
-            return false;
+            return keepDuringGrace(entry);
 
         // Force-load the interior on demand (getOrLoad) so even an empty/unvisited TARDIS shows its room through the
         // doorway. The proxy + chunk tickets then keep it loaded while viewed; it unloads once no one is looking.
         ServerWorld interior = tardis.world();
         if (interior == null)
-            return false;
+            return keepDuringGrace(entry);
 
         BlockPos doorPos     = tardis.getDesktop().getDoorPos().getPos();
         UUID portalId        = Portals.interiorId(key);
         Set<UUID> viewerIds  = idsOf(viewers);
-
-        ProxyEntry entry = INTERIOR_PROXIES.get(key);
 
         if (entry == null) {
             INTERIOR_PROXIES.put(key, createInteriorProxy(tardis, interior, doorPos, viewerIds));
             return true;
         }
 
-        boolean newViewer = !entry.viewers.containsAll(viewerIds);
-        entry.viewers = viewerIds;
+        // Genuinely viewable this cycle — refresh the grace window so a later door-close/step-out is tolerated.
+        entry.graceDeadline = System.currentTimeMillis() + INTERIOR_GRACE_MS;
 
-        // Interior dimension changed (interior swap) or a new viewer arrived — rebuild so they get the full re-send.
-        if (!entry.world.getRegistryKey().equals(interior.getRegistryKey()) || newViewer) {
+        boolean newViewer = !entry.viewers.containsAll(viewerIds);
+        boolean dimChanged = !entry.world.getRegistryKey().equals(interior.getRegistryKey());
+
+        // The interior changed (block placed/broken, redstone, fluids...) while nobody was viewing, so those updates
+        // were dropped (no recipient) and the grace window kept the stale stream alive instead of re-initialising it.
+        // Re-send the whole interior now that someone is actually looking again, otherwise the mirror stays frozen at
+        // whatever it showed before they last looked away — the "went in, broke blocks, came out, nothing changed" bug.
+        boolean dirtyWhileUnviewed = entry.worldDirtyRef != null && entry.worldDirtyRef[0];
+
+        // Interior dimension changed (interior swap), a new viewer arrived, or the world drifted while unviewed —
+        // rebuild so the current viewer(s) get the full, up-to-date re-send.
+        if (dimChanged || newViewer || dirtyWhileUnviewed) {
+            entry.viewers = viewerIds;
             despawn(entry);
-            INTERIOR_PROXIES.put(key, createInteriorProxy(tardis, interior, doorPos, viewerIds));
+            ProxyEntry rebuilt = createInteriorProxy(tardis, interior, doorPos, viewerIds);
+            INTERIOR_PROXIES.put(key, rebuilt);
             return true;
         }
+        entry.viewers = viewerIds;
 
         broadcastTime(portalId, viewers, interior);
         maybeBroadcastWeather(portalId, viewers, interior, entry);
@@ -369,9 +421,14 @@ public class BiggerOnTheInside implements ModInitializer {
 
         BlockPos[] posRef = { doorPos };
 
+        // Mutable box shared with the packet-listener lambda (which is created before the ProxyEntry exists). The
+        // lambda flips it true whenever a block/chunk change is dropped because nobody is viewing right now, so
+        // ensureInteriorProxy knows to re-sync the returning viewer instead of leaving them a stale mirror.
+        boolean[] dirtyRef = { false };
+
         PacketProxyPlayer proxy = new PacketProxyPlayer(interior);
         proxy.setPos(doorPos.getX(), doorPos.getY(), doorPos.getZ());
-        proxy.setPacketListener(packet -> forwardIfInRange(portalId, () -> exteriorViewers(tardis), posRef[0], packet));
+        proxy.setPacketListener(packet -> forwardInteriorIfInRange(portalId, tardis, posRef[0], dirtyRef, packet));
 
         interior.spawnEntity(proxy);
         // proxy.onChunkEntered();
@@ -383,7 +440,10 @@ public class BiggerOnTheInside implements ModInitializer {
         broadcastWeather(portalId, viewers, rain, thunder);
         broadcastCenter(portalId, viewers, proxy);
 
-        return new ProxyEntry(portalId, proxy, interior, posRef, doorPos, viewerIds, rain, thunder);
+        ProxyEntry entry = new ProxyEntry(portalId, proxy, interior, posRef, doorPos, viewerIds, rain, thunder);
+        entry.graceDeadline = System.currentTimeMillis() + INTERIOR_GRACE_MS;
+        entry.worldDirtyRef = dirtyRef;
+        return entry;
     }
 
     private static void removeInteriorProxy(UUID key) {
@@ -437,7 +497,7 @@ public class BiggerOnTheInside implements ModInitializer {
                 world.getChunkManager().addTicket(
                         PORTAL_TICKET,
                         new ChunkPos(origin.x + dx, origin.z + dz),
-                        0,          // no level propagation beyond the specified chunk
+                        TICKING_RADIUS, // level 31 (ENTITY_TICKING) so the mirrored chunk actually simulates
                         tardisId);
             }
         }
@@ -451,7 +511,7 @@ public class BiggerOnTheInside implements ModInitializer {
                 world.getChunkManager().removeTicket(
                         PORTAL_TICKET,
                         new ChunkPos(origin.x + dx, origin.z + dz),
-                        0,
+                        TICKING_RADIUS,
                         tardisId);
             }
         }
@@ -479,6 +539,40 @@ public class BiggerOnTheInside implements ModInitializer {
             return;
         if (shouldForward(packet))
             broadcast(portalId, viewers.get(), packet);
+    }
+
+    /**
+     * Interior-stream forward. Same range/whitelist filtering as {@link #forwardIfInRange}, but because the interior
+     * stream is kept alive across viewer-absence by the grace window (rather than re-initialised on every door open),
+     * a block/chunk change that arrives while nobody is viewing has no recipient and would simply be lost - leaving a
+     * stale mirror when the viewer returns. When that happens we flip {@code dirtyRef} so
+     * {@link #ensureInteriorProxy} re-syncs on the next actual view. Entity/particle updates are deliberately not
+     * treated as "dirty": they re-stream from current state on any re-init anyway, and a mob merely wandering while
+     * you looked away should not force a full rebuild when you look back.
+     */
+    private static void forwardInteriorIfInRange(UUID portalId, ServerTardis tardis, BlockPos center,
+                                                 boolean[] dirtyRef, Packet<?> packet) {
+        if (isChunkPacketOutOfRange(packet, center))
+            return;
+        if (!shouldForward(packet))
+            return;
+
+        List<ServerPlayerEntity> viewers = exteriorViewers(tardis);
+        if (viewers.isEmpty()) {
+            if (isWorldChange(packet))
+                dirtyRef[0] = true;
+            return;
+        }
+
+        broadcast(portalId, viewers, packet);
+    }
+
+    /** Block/chunk mutations whose loss while unviewed leaves the mirror stale (unlike transient entity motion). */
+    private static boolean isWorldChange(Packet<?> packet) {
+        return packet instanceof BlockUpdateS2CPacket
+                || packet instanceof ChunkDeltaUpdateS2CPacket
+                || packet instanceof ChunkDataS2CPacket
+                || packet instanceof UnloadChunkS2CPacket;
     }
 
     /**
@@ -679,6 +773,21 @@ public class BiggerOnTheInside implements ModInitializer {
         /** Last-sent weather values for change-detection. */
         float lastRain;
         float lastThunder;
+
+        /**
+         * Interior streams only: wall-clock deadline (ms) until which the stream is kept alive even when not strictly
+         * viewable, so ordinary door open/close and step-in/step-out don't force a full re-stream + client mesh
+         * rebuild. Unused (0) for exterior streams.
+         */
+        long graceDeadline;
+
+        /**
+         * Interior streams only: single-element mutable box shared with the proxy's packet-listener lambda. The lambda
+         * sets it {@code true} when a block/chunk change is dropped because nobody is viewing (see
+         * {@link BiggerOnTheInside#forwardInteriorIfInRange}); {@link BiggerOnTheInside#ensureInteriorProxy} reads it
+         * to decide whether a returning viewer needs a full re-sync. {@code null} for exterior streams.
+         */
+        boolean[] worldDirtyRef;
 
         ProxyEntry(UUID tardisId, PacketProxyPlayer proxy, ServerWorld world,
                    BlockPos[] posRef, BlockPos pos, Set<UUID> viewers,

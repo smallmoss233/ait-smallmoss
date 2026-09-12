@@ -51,6 +51,11 @@ public class PortalDataManager {
         });
 
         ClientTickEvents.END_CLIENT_TICK.register(minecraftClient -> {
+            // Idle window (config, seconds -> nanos) after which an unviewed doorway's baked geometry is reclaimed.
+            // CONFIG is set at client init, well before any portal ticks; fall back to the 10s default if it isn't.
+            long idleReclaimNanos = (long) (dev.amble.ait.client.AITModClient.CONFIG != null
+                    ? dev.amble.ait.client.AITModClient.CONFIG.botiIdleReclaimSeconds : 10) * 1_000_000_000L;
+
             for (PortalData data : new ArrayList<>(map.values())) {
                 // Each per-tick step is isolated so a failure in one can't skip the ones after it. In particular
                 // entity ticking must run every tick regardless of the chunk/time steps: if it were skipped on the
@@ -69,8 +74,37 @@ public class PortalDataManager {
                 // jumping forward once a second. The periodic packet stays authoritative and corrects any drift.
                 step(data, "clock", d -> d.world().tickTime());
 
-                step(data, "entities", PortalData::tickEntities);
+                // Tick the shadow world's block entities exactly like ClientWorld#tickEntities does at its tail. The
+                // shadow world isn't in the client tick loop, so without this its block entities never tick - and any
+                // BE animation driven by the BE's own age/tick counter (the TARDIS console rotor reads
+                // console.getAge(); see SimpleConsoleModel) freezes through the doorway. shouldTickBlocksInChunk is
+                // always true on the client, and chunk streaming registers the BE tickers, so this drives them.
+                //
+                // Route particles spawned during the shadow world's simulation into the portal's manager, exactly
+                // like spawnDisplayParticles does. Block entities (campfire smoke, spawner swirls, brewing bubbles)
+                // and entities (mob ambient, potion effects, item bob) spawn via world.addParticle, which targets
+                // MinecraftClient#particleManager; without this swap those particles land in the dimension the player
+                // is standing in at the shadow world's (exterior) coordinates - appearing off in the distance with no
+                // visible emitter. The portal manager is ticked below and rendered in the doorway, so they show
+                // through the portal where they belong.
+                PortalParticleManager simManager = particles.computeIfAbsent(data.id(),
+                        uuid -> new PortalParticleManager(data.world(), client));
+                ParticleManager prevManager = client.particleManager;
+                client.particleManager = simManager;
+                try {
+                    step(data, "block entities", d -> d.world().tickBlockEntities());
+                    step(data, "entities", PortalData::tickEntities);
+                } finally {
+                    client.particleManager = prevManager;
+                }
+
                 step(data, "particles", PortalDataManager::spawnDisplayParticles);
+
+                // Reclaim baked geometry for a doorway nobody has looked at recently. This runs for EVERY portal,
+                // not just the one being viewed - that's the point: a TARDIS whose interior is loaded but off-screen
+                // never calls render(), so this tick step is the only place its VBOs can be freed. GL-safe here: the
+                // client tick runs on the render thread. The shadow world stays live, so updates keep flowing in.
+                step(data, "geometry reclaim", d -> d.geometry().reclaimIfIdle(idleReclaimNanos));
             }
 
             for (PortalParticleManager manager : new ArrayList<>(particles.values())) {
@@ -104,13 +138,39 @@ public class PortalDataManager {
         if (center == null || center.equals(BlockPos.ORIGIN))
             return;
 
+        // Spawn the ambient display-tick particles in the VISIBLE region - in front of the portal eye, along the
+        // door normal - not around centerPos. Vanilla samples around the player/camera; centring on centerPos (the
+        // door block) put the whole sample cube behind the portal eye (NDC diag: every particle had clipW < 0, i.e.
+        // behind the near plane) so they were all clipped. The eye itself often sits in open air just outside the
+        // door, so we push the sample centre a half-radius forward along the door normal into the terrain the doorway
+        // actually shows. Falls back to centerPos until the portal has rendered once (eye/normal unknown).
+        net.minecraft.util.math.Vec3d eye = data.geometry().eyeWorldPos();
+        int radius = Math.min(data.geometry().renderDistance(), 24);
+        int cx, cy, cz;
+        if (eye != null) {
+            // Sample around the eye itself. A previous "eye + normal*radius/2" push helped the open exterior but
+            // overshot small interior rooms (sample centre landed in the void beyond the walls, so nothing spawned).
+            // Centring on the eye covers the visible region for both - the triangular nextInt spread keeps most
+            // samples near the eye where the viewer is actually looking.
+            cx = (int) Math.floor(eye.x);
+            cy = (int) Math.floor(eye.y);
+            cz = (int) Math.floor(eye.z);
+        } else {
+            cx = center.getX();
+            cy = center.getY();
+            cz = center.getZ();
+        }
+
         PortalParticleManager manager = particles.computeIfAbsent(data.id(),
                 uuid -> new PortalParticleManager(data.world(), client));
 
         ParticleManager previous = client.particleManager;
         client.particleManager = manager;
         try {
-            data.spawnDisplayParticles(center.getX(), center.getY(), center.getZ(), data.geometry().renderDistance());
+            // radius capped at vanilla's ~32: over the 48+ bake radius, 667 samples are far too sparse to hit an
+            // emitting block; vanilla concentrates its 667 samples in a ~32 cube (the nextInt-minus-nextInt spread is
+            // triangular, densest at the centre) so particles actually appear.
+            data.spawnDisplayParticles(cx, cy, cz, radius);
         } finally {
             client.particleManager = previous;
         }
